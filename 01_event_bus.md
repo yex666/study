@@ -711,6 +711,149 @@ async with bus.stream(ToolCallEvent, ShellToolCallEvent) as stream:
 - stream 通常用于消费端，允许宽泛匹配
 - subscribe 用于生产端，需要精确控制
 
+### 既然 subscribe 是精确匹配，继承还有什么意义？
+
+**直觉是对的**：如果只有精确匹配，继承在"分发"层面确实没用。但继承的价值在别处：
+
+| 场景 | 继承是否起作用 |
+|------|---------------|
+| `subscribe` 分发匹配 | ❌ 精确类型，继承不参与 |
+| `stream` 分发匹配 | ✅ isinstance，继承参与 |
+| 类型标注/补全 | ✅ 继承有作用 |
+| 消费端自己 isinstance 分类 | ✅ 继承有作用 |
+| 共享字段/方法（代码复用） | ✅ 继承有作用 |
+
+关键点：
+1. **`stream` 用 isinstance 匹配**（`_EventStream._deliver` 源码）→ 订阅父类能收到子类事件；`subscribe` 用精确类型 → 收不到。
+2. **类型标注**：`handler(event: ToolCallEvent)` 让 IDE 补全 `event.tool_name`。
+3. **消费端自行分类**：`isinstance(event, ShellToolCallEvent)` 自己决定特殊处理。
+4. **代码复用**：共享字段（`tool_name`/`tool_kind`）和方法。
+
+> **为什么 subscribe 用精确匹配？** 保证"可预测"——订阅者知道会收到什么，不被意外子类触发。stream 用 isinstance 补回了继承的分发价值。
+
+---
+
+## 7.5 执行顺序：怎么判断谁先执行？
+
+### 默认行为：按订阅顺序执行（FIFO）
+
+```python
+bus.subscribe(ToolCallEvent, handler_A)   # 先订阅
+bus.subscribe(ToolCallEvent, handler_B)   # 后订阅
+# 内部：self.handlers[ToolCallEvent] = [A, B]
+# publish 时按列表顺序挨个执行：先 A，再 B
+```
+
+**前提**：订阅者之间默认"无顺序依赖"——UI 更新、写日志、存历史互不相关，谁先谁后无所谓。
+
+### 有依赖怎么办？
+
+- **两个 handler 有依赖** → 合并成一个 handler，自己控制顺序（先 `save_to_db` 再 `notify_ui`）
+- **需要跨模块严格顺序** → 用中间件（洋葱模型：进入时先执行、返回时后执行），或直接函数调用，不用 EventBus
+
+### 总结
+
+| 问题 | 答案 |
+|------|------|
+| 默认执行顺序？ | 按订阅顺序（先订阅先执行） |
+| handler 之间有依赖？ | 合并成一个 handler |
+| 需要跨模块严格顺序？ | 用中间件，不用 EventBus |
+| Subscribe 是并发的吗？ | 不是，`await` 串行执行 |
+| Stream 是并发的吗？ | 是，各自独立消费队列 |
+
+> **一句话**：EventBus 只保证"按订阅顺序 + 串行等待"，不提供优先级或依赖排序——它假定订阅者互相独立。有依赖就用中间件或函数调用。
+
+---
+
+## 7.6 生产者-消费者模式：角色到底怎么分？
+
+### 角色对照
+
+```
+生产者（Producer）= 调用 publish 的一方（产生事件）
+消费者（Consumer）= 订阅的一方（接收并处理事件）
+EventBus         = 中间的"消息通道"（分发）
+
+publish(event)  →  EventBus  →  subscribe 的 handler / stream 的队列
+（生产者产出）                    （消费者消费）
+```
+
+**`subscribe` 定义的是消费者（谁接收），`publish` 定义的是生产者（谁产生）。**
+
+### 为什么"订阅"看起来像"注册"？
+
+消费者必须**提前告诉总线"我要什么类型"**，总线才知道推给谁：
+
+```python
+# 消费者自报家门（订阅）
+bus.subscribe(ToolCallEvent, save_to_db)
+# 含义：我是消费者，我只关心 ToolCallEvent，请发给我
+
+# 生产者产生消息（发布）
+await bus.publish(ToolCallEvent("read_file"))
+# 含义：我产生了一个 ToolCallEvent，请发给所有订阅者
+```
+
+### 角色对照表
+
+| 术语 | 角色 | 做什么 |
+|------|------|--------|
+| `publish(event)` | **生产者** | 产生事件 |
+| `subscribe(类型, handler)` | **消费者** | 注册"我要接收这个类型" |
+| `stream(类型)` | **消费者** | 注册"我要排队接收这个类型" |
+| EventBus | 通道 | 把事件分发给所有匹配的消费者 |
+
+> **一句话**："订阅"更像是"登记接收"——消费者向总线声明："我在这里，有这类事件就找我。"
+
+---
+
+## 7.7 事件会很多吗？ID 和时间戳怎么区分？
+
+### 事件确实很多
+
+一次简单的对话可能产生**几十个事件**：
+
+| 操作 | 产生的事件 |
+|------|-----------|
+| 用户发消息 | `UserMessage` 1 个 |
+| 开始执行 turn | `ExecutionChanged` 若干 |
+| 调用 LLM | `InvocationMessage`、`AgentThinking` 若干 |
+| LLM 请求 read_file | `InvocationToolCallStart` + `InvocationToolCallUpdate` + `InvocationToolResult` |
+| LLM 再调用 write_file | 又 3 个 |
+
+### 每个事件有自己的 ID 和时间戳
+
+```python
+# src/chrys/foundation/events/types.py
+@dataclass
+class Event:
+    event_id: str = field(default_factory=lambda: uuid4().hex[:12])  # ← 每个事件独立 ID
+    timestamp: datetime = field(default_factory=lambda: datetime.now(tz=UTC))  # ← 每个事件独立时间
+    session_id: str | None = None
+```
+
+### 注意：有两套完全不同的 ID，别混了！
+
+| ID | 属于谁 | 什么时候生成 | 特点 |
+|----|--------|-------------|------|
+| **event_id** | 事件对象本身 | publish 时创建 | 每个事件都不同 |
+| **call_id** | 工具调用 | LLM 返回时 | 同一个工具调用期间**不变** |
+
+```python
+# 一次工具调用产生 3 个事件
+evt1 = InvocationToolCallStart(...);  evt1.event_id = "a1b2c3";  evt1.call_id = "call_001"
+evt2 = InvocationToolCallUpdate(...); evt2.event_id = "d4e5f6";  evt2.call_id = "call_001"  # call_id 不变
+evt3 = InvocationToolResult(...);     evt3.event_id = "g7h8i9";  evt3.call_id = "call_001"  # call_id 不变
+```
+
+**规律**：
+- `event_id`：**事件级**，一事件一 ID，像快递单号
+- `call_id`：**工具调用级**，整个调用期间不变，像"订单号"——把"开始→更新→结果"串起来
+
+**UI 端怎么用？** 用 `event_id` 保证唯一，用 `timestamp` 排序时间线，用 `call_id` 把同一调用的多个事件串成一张卡片。
+
+> **一句话**：事件是"快照流"——每个事件 = 自己的 ID + 自己的时间戳；多个事件通过 `call_id`（订单号）串成"同一次工具调用的完整记录"。
+
 ---
 
 ## 8. 实际使用场景
